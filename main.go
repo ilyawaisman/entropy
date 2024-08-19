@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"golang.org/x/term"
@@ -33,6 +34,16 @@ var (
 	includeBinaryFiles  bool     // Include binary files in search.
 	disableAdvancedMode bool     // Advanced mode : filters more than just entropy
 )
+
+// The default setting for the go runtime
+const goRuntimeMaxThreads = 10000
+// Although in general the runtime can spawn more goroutines than it uses OS threads, in this specific case
+// most of the goroutines are waiting on IO, holding the underlying OS threads, since disk IO is implemented
+// in a blocking way. Therefore, we don't want to read more files simultaneously than the thread limit.
+// Consideration. It is possible to increase the thread limit with debug.SetMaxThreads(n).
+// It doesn't push the needle too much with PCIe Gen 3.0 SSD but it might for newer drives.
+// Also, reserve a few threads for main and whatnot.
+const maxWorkers = goRuntimeMaxThreads - 128
 
 type Entropy struct {
 	Entropy float64 // Entropy of the line
@@ -145,11 +156,14 @@ func main() {
 		fileNames = []string{"."}
 	}
 	entropies := NewEntropies(resultCount)
+	// Define a limiter for parallel workers
+	workerChan := make(chan struct{}, maxWorkers)
 	for _, fileName := range fileNames {
-		err := readFile(entropies, fileName)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error reading file %s: %v\n", fileName, err)
-		}
+		processFile(entropies, fileName, workerChan)
+	}
+	// Wait for all workers to complete by waiting for the worker channel to empty
+	for len(workerChan) > 0 {
+		time.Sleep(time.Millisecond)
 	}
 
 	redMark := "\033[31m"
@@ -171,7 +185,18 @@ func main() {
 	}
 }
 
-func readFile(entropies *Entropies, fileName string) error {
+func processFile(entropies *Entropies, fileName string, workerChan chan struct{}) {
+	workerChan <- struct{}{}
+	go func(fileName string) {
+		defer func() { <-workerChan }()
+		err := readFile(entropies, fileName, workerChan)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error reading file %s: %v\n", fileName, err)
+		}				
+	}(fileName)
+}
+
+func readFile(entropies *Entropies, fileName string, workerChan chan struct{}) error {
 	fileInfo, err := os.Stat(fileName)
 	if err != nil {
 		return err
@@ -187,19 +212,9 @@ func readFile(entropies *Entropies, fileName string) error {
 			return err
 		}
 
-		var wg sync.WaitGroup
-		for i, file := range dir {
-			wg.Add(1)
-			go func(i int, file os.DirEntry) {
-				defer wg.Done()
-				err := readFile(entropies, fileName+"/"+file.Name())
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error reading file %s: %v\n", file.Name(), err)
-				}
-			}(i, file)
+		for _, file := range dir {
+			processFile(entropies, fileName+"/"+file.Name(), workerChan)
 		}
-
-		wg.Wait()
 	}
 
 	if !isFileIncluded(fileInfo.Name()) {
